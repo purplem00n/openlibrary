@@ -332,7 +332,6 @@ class Edition(models.Edition):
             if name == 'lccn':
                 value = normalize_lccn(value)
             # `None` in this field causes errors. See #7999.
-            # We should surface to the patron that an invalid LCCN is dropped. See #8092.
             if value is not None:
                 d.setdefault(name, []).append(value)
 
@@ -512,7 +511,7 @@ class Author(models.Author):
     def get_books(self, q=''):
         i = web.input(sort='editions', page=1, rows=20, mode="")
         try:
-            # safegaurd from passing zero/negative offsets to solr
+            # safeguard from passing zero/negative offsets to solr
             page = max(1, int(i.page))
         except ValueError:
             page = 1
@@ -1016,6 +1015,12 @@ class ListChangeset(Changeset):
         return models.Seed(self.get_list(), seed)
 
 
+class Tag(models.Tag):
+    """Class to represent /type/tag objects in Open Library."""
+
+    pass
+
+
 def setup():
     models.register_models()
 
@@ -1027,6 +1032,7 @@ def setup():
     client.register_thing_class('/type/place', SubjectPlace)
     client.register_thing_class('/type/person', SubjectPerson)
     client.register_thing_class('/type/user', User)
+    client.register_thing_class('/type/tag', Tag)
 
     client.register_changeset_class(None, Changeset)  # set the default class
     client.register_changeset_class('merge-authors', MergeAuthors)

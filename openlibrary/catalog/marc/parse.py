@@ -1,5 +1,5 @@
 import re
-from typing import Any, Optional
+from typing import Any
 from collections.abc import Callable
 
 from openlibrary.catalog.marc.get_subjects import subjects_for_work
@@ -300,7 +300,7 @@ def read_original_languages(rec: MarcBase) -> list[str]:
     return [lang_map.get(v, v) for v in found if v != 'zxx']
 
 
-def read_languages(rec: MarcBase, lang_008: Optional[str] = None) -> list[str]:
+def read_languages(rec: MarcBase, lang_008: str | None = None) -> list[str]:
     """Read languages from 041, if present, and combine with language from 008:35-37"""
     found = []
     if lang_008:
@@ -413,9 +413,10 @@ def read_author_person(field: MarcFieldBase, tag: str = '100') -> dict | None:
     if 'q' in contents:
         author['fuller_name'] = ' '.join(contents['q'])
     if '6' in contents:  # noqa: SIM102 - alternate script name exists
-        if link := field.rec.get_linkage(tag, contents['6'][0]):
-            if alt_name := link.get_subfield_values('a'):
-                author['alternate_names'] = [name_from_list(alt_name)]
+        if (link := field.rec.get_linkage(tag, contents['6'][0])) and (
+            alt_name := link.get_subfield_values('a')
+        ):
+            author['alternate_names'] = [name_from_list(alt_name)]
     return author
 
 

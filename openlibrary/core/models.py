@@ -756,7 +756,7 @@ class User(Thing):
         # New users are now public by default for new patrons
         # As of 2020-05, OpenLibraryAccount.create will
         # explicitly set public_readlog: 'yes'.
-        # Legacy acconts w/ no public_readlog key
+        # Legacy accounts w/ no public_readlog key
         # will continue to default to 'no'
     }
 
@@ -803,8 +803,14 @@ class User(Thing):
             usergroup = '/usergroup/%s' % usergroup
         return usergroup in [g.key for g in self.usergroups]
 
+    def has_cookie(self, name):
+        return web.cookies().get(name, False)
+
     def is_printdisabled(self):
         return web.cookies().get('pd')
+
+    def is_screener_eligible(self):
+        return web.cookies().get('se')
 
     def is_admin(self):
         return self.is_usergroup_member('/usergroup/admin')
@@ -1123,6 +1129,12 @@ class Subject(web.storage):
 class Tag(Thing):
     """Class to represent /type/tag objects in OL."""
 
+    def url(self, suffix="", **params):
+        return self.get_url(suffix, **params)
+
+    def get_url_suffix(self):
+        return self.name or "unnamed"
+
     @classmethod
     def find(cls, tag_name, tag_type):
         """Returns a Tag object for a given tag name and tag type."""
@@ -1142,7 +1154,7 @@ class Tag(Thing):
     ):
         """Creates a new Tag object."""
         current_user = web.ctx.site.get_user()
-        patron = current_user and current_user.username or 'ImportBot'
+        patron = current_user.get_username() if current_user else 'ImportBot'
         key = web.ctx.site.new_key('/type/tag')
         from openlibrary.accounts import RunAs
 
@@ -1160,12 +1172,6 @@ class Tag(Thing):
                 comment=comment,
             )
             return key
-
-    def url(self, suffix="", **params):
-        return self.get_url(suffix, **params)
-
-    def get_url_suffix(self):
-        return self.name or "unnamed"
 
 
 @dataclass

@@ -5,7 +5,6 @@ from collections import namedtuple
 import json
 import os
 import sys
-from typing import Union
 from collections.abc import Iterator
 
 import web
@@ -127,7 +126,7 @@ def get_references(doc, result=None):
         if 'key' in doc and len(doc) == 1:
             result.append(doc['key'])
 
-        for k, v in doc.items():
+        for v in doc.values():
             get_references(v, result)
     return result
 
@@ -357,10 +356,10 @@ def main(
 
     # Mypy doesn't handle union-ing types across if statements -_-
     # https://github.com/python/mypy/issues/6233
-    src_ol: Union[Disk, OpenLibrary] = (
+    src_ol: Disk | OpenLibrary = (
         OpenLibrary(src) if src.startswith("http://") else Disk(src)
     )
-    dest_ol: Union[Disk, OpenLibrary] = (
+    dest_ol: Disk | OpenLibrary = (
         OpenLibrary(dest) if dest.startswith("http://") else Disk(dest)
     )
 

@@ -1,5 +1,5 @@
 import functools
-from typing import Any, Protocol, TYPE_CHECKING
+from typing import Any, Protocol, TYPE_CHECKING, TypeVar
 from collections.abc import Callable, Iterable, Iterator
 import unicodedata
 
@@ -16,6 +16,7 @@ import xml.etree.ElementTree as etree
 import datetime
 import logging
 from html.parser import HTMLParser
+from pathlib import Path
 
 import requests
 
@@ -204,10 +205,7 @@ def render_component(
         html += '<script src="%s"></script>' % url
         included.append(name)
 
-    html += '<ol-{name} {attrs}></ol-{name}>'.format(
-        name=kebab_case(name),
-        attrs=attrs_str,
-    )
+    html += f'<ol-{kebab_case(name)} {attrs_str}></ol-{kebab_case(name)}>'
     return html
 
 
@@ -290,7 +288,9 @@ def unflatten(d: Storage, separator: str = "--") -> Storage:
             k, k2 = k.split(separator, 1)
             setvalue(data.setdefault(k, {}), k2, v)
         else:
-            data[k] = v
+            # Don't overwrite if the key already exists
+            if k not in data:
+                data[k] = v
 
     def makelist(d):
         """Convert d into a list if all the keys of d are integers."""
@@ -677,7 +677,10 @@ def parse_toc(text: None) -> list[Any]:
     return [parse_toc_row(line) for line in text.splitlines() if line.strip(" |")]
 
 
-def safeget(func: Callable) -> Any:
+T = TypeVar('T')
+
+
+def safeget(func: Callable[[], T], default=None) -> T:
     """
     TODO: DRY with solrbuilder copy
     >>> safeget(lambda: {}['foo'])
@@ -690,7 +693,7 @@ def safeget(func: Callable) -> Any:
     try:
         return func()
     except (KeyError, IndexError, TypeError):
-        return None
+        return default
 
 
 def strip_accents(s: str) -> str:
@@ -1079,6 +1082,11 @@ _get_blog_feeds = cache.memcache_memoize(
 
 
 @public
+def is_jsdef():
+    return False
+
+
+@public
 def get_donation_include() -> str:
     ia_host = get_ia_host(allow_dev=True)
     # The following allows archive.org staff to test banners without
@@ -1305,6 +1313,24 @@ def get_location_and_publisher(loc_pub: str) -> tuple[list[str], list[str]]:
 
     # Fall back to making the input a list returning that and an empty location.
     return ([], [loc_pub.strip(STRIP_CHARS)])
+
+
+@cache.memoize(engine="memcache", key="edu_domains", expires=0)
+def get_edu_domains() -> list[str]:
+    """
+    This list created using this gist: https://gist.github.com/jimchamp/f67ef14c3bcf11593f393ee5288f6476 on
+    https://raw.githubusercontent.com/Hipo/university-domains-list/master/world_universities_and_domains.json.
+
+    See: https://github.com/internetarchive/openlibrary/issues/8180
+    """
+    p = Path(Path.cwd(), 'static', 'edu-domains.txt')
+
+    results = []
+    with p.open() as f:
+        for line in f:
+            results.append(line.strip())
+
+    return results
 
 
 def setup() -> None:

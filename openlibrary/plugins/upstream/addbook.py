@@ -193,12 +193,14 @@ class addbook(delegate.page):
         if not self.has_permission():
             return safe_seeother(f"/account/login?redirect={self.path}")
 
-        i = web.input(work=None, author=None)
+        i = web.input(work=None)
         work = i.work and web.ctx.site.get(i.work)
-        author = i.author and web.ctx.site.get(i.author)
+        authors = (work and work.authors) or []
+        if work and authors:
+            authors = [a.author for a in authors]
 
         return render_template(
-            'books/add', work=work, author=author, recaptcha=get_recaptcha()
+            'books/add', work=work, authors=authors, recaptcha=get_recaptcha()
         )
 
     def has_permission(self) -> bool:
@@ -778,14 +780,14 @@ class SaveBookHelper:
             return
 
         # read ocaid from form data
-        try:
-            ocaid = [
-                id['value']
-                for id in edition.get('identifiers', [])
-                if id['name'] == 'ocaid'
-            ][0]
-        except IndexError:
-            ocaid = None
+        ocaid = next(
+            (
+                id_['value']
+                for id_ in edition.get('identifiers', [])
+                if id_['name'] == 'ocaid'
+            ),
+            None,
+        )
 
         # 'self.edition' is the edition doc from the db and 'edition' is the doc from formdata
         if (
@@ -1008,9 +1010,7 @@ class author_edit(delegate.page):
             author = trim_doc(i.author)
             alternate_names = author.get('alternate_names', None) or ''
             author.alternate_names = [
-                name.strip()
-                for name in alternate_names.replace("\n", ";").split(';')
-                if name.strip()
+                name.strip() for name in alternate_names.split('\n') if name.strip()
             ]
             author.links = author.get('links') or []
             return author

@@ -23,7 +23,7 @@ A record is loaded by calling the load function.
 
 """
 import re
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import web
 
@@ -36,10 +36,19 @@ import requests
 from infogami import config
 
 from openlibrary import accounts
-from openlibrary.catalog.merge.merge_marc import build_marc
-from openlibrary.catalog.utils import mk_norm
+from openlibrary.catalog.utils import (
+    EARLIEST_PUBLISH_YEAR_FOR_BOOKSELLERS,
+    get_publication_year,
+    is_independently_published,
+    is_promise_item,
+    mk_norm,
+    needs_isbn_and_lacks_one,
+    publication_too_old_and_not_exempt,
+    published_in_future_year,
+)
 from openlibrary.core import lending
-from openlibrary.plugins.upstream.utils import strip_accents
+from openlibrary.plugins.upstream.utils import strip_accents, safeget
+from openlibrary.catalog.utils import expand_record
 from openlibrary.utils import uniq, dicthash
 from openlibrary.utils.isbn import normalize_isbn
 from openlibrary.utils.lccn import normalize_lccn
@@ -53,7 +62,7 @@ from openlibrary.catalog.add_book.load_book import (
 from openlibrary.catalog.add_book.match import editions_match
 
 if TYPE_CHECKING:
-    from openlibrary.core.models import Edition, Work
+    from openlibrary.plugins.upstream.models import Edition
 
 re_normalize = re.compile('[^[:alphanum:] ]', re.U)
 re_lang = re.compile('^/languages/([a-z]{3})$')
@@ -80,7 +89,39 @@ class RequiredField(Exception):
         self.f = f
 
     def __str__(self):
-        return "missing required field: %s" % self.f
+        return "missing required field(s): %s" % ", ".join(self.f)
+
+
+class PublicationYearTooOld(Exception):
+    def __init__(self, year):
+        self.year = year
+
+    def __str__(self):
+        return f"publication year is too old (i.e. earlier than {EARLIEST_PUBLISH_YEAR_FOR_BOOKSELLERS}): {self.year}"
+
+
+class PublishedInFutureYear(Exception):
+    def __init__(self, year):
+        self.year = year
+
+    def __str__(self):
+        return f"published in future year: {self.year}"
+
+
+class IndependentlyPublished(Exception):
+    def __init__(self):
+        pass
+
+    def __str__(self):
+        return "book is independently published"
+
+
+class SourceNeedsISBN(Exception):
+    def __init__(self):
+        pass
+
+    def __str__(self):
+        return "this source needs an ISBN"
 
 
 # don't use any of these as work titles
@@ -488,7 +529,7 @@ def find_exact_match(rec, edition_pool):
     :return: edition key
     """
     seen = set()
-    for field, editions in edition_pool.items():
+    for editions in edition_pool.values():
         for ekey in editions:
             if ekey in seen:
                 continue
@@ -532,7 +573,7 @@ def find_enriched_match(rec, edition_pool):
     :rtype: str|None
     :return: None or the edition key '/books/OL...M' of the best edition match for enriched_rec in edition_pool
     """
-    enriched_rec = build_marc(rec)
+    enriched_rec = expand_record(rec)
     add_db_name(enriched_rec)
 
     seen = set()
@@ -577,9 +618,19 @@ def add_db_name(rec: dict) -> None:
         a['db_name'] = ' '.join([a['name'], date]) if date else a['name']
 
 
-def load_data(rec, account_key=None):
+def load_data(
+    rec: dict,
+    account_key: str | None = None,
+    existing_edition: "Edition | None" = None,
+):
     """
-    Adds a new Edition to Open Library. Checks for existing Works.
+    Adds a new Edition to Open Library, or overwrites existing_edition with rec data.
+
+    The overwrite option exists for cases where the existing edition data
+    should be (nearly) completely overwritten by rec data. Revision 1 promise
+    items are an example.
+
+    Checks for existing Works.
     Creates a new Work, and Author, if required,
     otherwise associates the new Edition with the existing Work.
 
@@ -605,21 +656,42 @@ def load_data(rec, account_key=None):
         del rec['cover']
     try:
         # get an OL style edition dict
-        edition = build_query(rec)
+        rec_as_edition = build_query(rec)
+        edition: dict[str, Any]
+        if existing_edition:
+            # Note: This will overwrite any fields in the existing edition. This is ok for
+            # now, because we'll really only come here when overwriting a promise
+            # item
+            edition = existing_edition.dict() | rec_as_edition
+
+            # Preserve source_records to avoid data loss.
+            edition['source_records'] = existing_edition.get(
+                'source_records', []
+            ) + rec.get('source_records', [])
+
+            # Preserve existing authors, if any.
+            if authors := existing_edition.get('authors'):
+                edition['authors'] = authors
+
+        else:
+            edition = rec_as_edition
+
     except InvalidLanguage as e:
         return {
             'success': False,
             'error': str(e),
         }
 
-    ekey = web.ctx.site.new_key('/type/edition')
+    if not (edition_key := edition.get('key')):
+        edition_key = web.ctx.site.new_key('/type/edition')
+
     cover_id = None
     if cover_url:
-        cover_id = add_cover(cover_url, ekey, account_key=account_key)
+        cover_id = add_cover(cover_url, edition_key, account_key=account_key)
     if cover_id:
         edition['covers'] = [cover_id]
 
-    edits = []  # Things (Edition, Work, Authors) to be saved
+    edits: list[dict] = []  # Things (Edition, Work, Authors) to be saved
     reply = {}
     # TOFIX: edition.authors has already been processed by import_authors() in build_query(), following line is a NOP?
     author_in = [
@@ -635,52 +707,58 @@ def load_data(rec, account_key=None):
         edition['authors'] = authors
         reply['authors'] = author_reply
 
-    wkey = None
+    work_key = safeget(lambda: edition['works'][0]['key'])
     work_state = 'created'
     # Look for an existing work
-    if 'authors' in edition:
-        wkey = find_matching_work(edition)
-    if wkey:
-        w = web.ctx.site.get(wkey)
+    if not work_key and 'authors' in edition:
+        work_key = find_matching_work(edition)
+    if work_key:
+        work = web.ctx.site.get(work_key)
         work_state = 'matched'
-        found_wkey_match = True
         need_update = False
         for k in subject_fields:
             if k not in rec:
                 continue
             for s in rec[k]:
                 if normalize(s) not in [
-                    normalize(existing) for existing in w.get(k, [])
+                    normalize(existing) for existing in work.get(k, [])
                 ]:
-                    w.setdefault(k, []).append(s)
+                    work.setdefault(k, []).append(s)
                     need_update = True
         if cover_id:
-            w.setdefault('covers', []).append(cover_id)
+            work.setdefault('covers', []).append(cover_id)
             need_update = True
         if need_update:
             work_state = 'modified'
-            edits.append(w.dict())
+            edits.append(work.dict())
     else:
         # Create new work
-        w = new_work(edition, rec, cover_id)
-        wkey = w['key']
-        edits.append(w)
+        work = new_work(edition, rec, cover_id)
+        work_state = 'created'
+        work_key = work['key']
+        edits.append(work)
 
-    assert wkey
-    edition['works'] = [{'key': wkey}]
-    edition['key'] = ekey
+    assert work_key
+    if not edition.get('works'):
+        edition['works'] = [{'key': work_key}]
+    edition['key'] = edition_key
     edits.append(edition)
 
-    web.ctx.site.save_many(edits, comment='import new book', action='add-book')
+    comment = "overwrite existing edition" if existing_edition else "import new book"
+    web.ctx.site.save_many(edits, comment=comment, action='add-book')
 
     # Writes back `openlibrary_edition` and `openlibrary_work` to
     # archive.org item after successful import:
     if 'ocaid' in rec:
-        update_ia_metadata_for_ol_edition(ekey.split('/')[-1])
+        update_ia_metadata_for_ol_edition(edition_key.split('/')[-1])
 
     reply['success'] = True
-    reply['edition'] = {'key': ekey, 'status': 'created'}
-    reply['work'] = {'key': wkey, 'status': work_state}
+    reply['edition'] = (
+        {'key': edition_key, 'status': 'modified'}
+        if existing_edition
+        else {'key': edition_key, 'status': 'created'}
+    )
+    reply['work'] = {'key': work_key, 'status': work_state}
     return reply
 
 
@@ -720,6 +798,32 @@ def normalize_import_record(rec: dict) -> None:
     rec['authors'] = uniq(rec.get('authors', []), dicthash)
 
 
+def validate_record(rec: dict) -> None:
+    """
+    Check for:
+        - publication years too old from non-exempt sources (e.g. Amazon);
+        - publish dates in a future year;
+        - independently published books; and
+        - books that need an ISBN and lack one.
+
+    Each check raises an error or returns None.
+
+    If all the validations pass, implicitly return None.
+    """
+    # Only validate publication year if a year is found.
+    if publication_year := get_publication_year(rec.get('publish_date')):
+        if publication_too_old_and_not_exempt(rec):
+            raise PublicationYearTooOld(publication_year)
+        elif published_in_future_year(publication_year):
+            raise PublishedInFutureYear(publication_year)
+
+    if is_independently_published(rec.get('publishers', [])):
+        raise IndependentlyPublished
+
+    if needs_isbn_and_lacks_one(rec):
+        raise SourceNeedsISBN
+
+
 def find_match(rec, edition_pool) -> str | None:
     """Use rec to try to find an existing edition key that matches."""
     match = find_quick_match(rec)
@@ -728,7 +832,7 @@ def find_match(rec, edition_pool) -> str | None:
 
     if not match:
         # Add 'full_title' to the rec by conjoining 'title' and 'subtitle'.
-        # build_marc() uses this for matching.
+        # expand_record() uses this for matching.
         rec['full_title'] = rec['title']
         if subtitle := rec.get('subtitle'):
             rec['full_title'] += ' ' + subtitle
@@ -739,7 +843,7 @@ def find_match(rec, edition_pool) -> str | None:
 
 
 def update_edition_with_rec_data(
-    rec: dict, account_key: str | None, e: "Edition"
+    rec: dict, account_key: str | None, edition: "Edition"
 ) -> bool:
     """
     Enrich the Edition by adding certain fields present in rec but absent
@@ -749,16 +853,16 @@ def update_edition_with_rec_data(
     """
     need_edition_save = False
     # Add cover to edition
-    if 'cover' in rec and not e.get_covers():
+    if 'cover' in rec and not edition.get_covers():
         cover_url = rec['cover']
-        cover_id = add_cover(cover_url, e.key, account_key=account_key)
+        cover_id = add_cover(cover_url, edition.key, account_key=account_key)
         if cover_id:
-            e['covers'] = [cover_id]
+            edition['covers'] = [cover_id]
             need_edition_save = True
 
     # Add ocaid to edition (str), if needed
-    if 'ocaid' in rec and not e.ocaid:
-        e['ocaid'] = rec['ocaid']
+    if 'ocaid' in rec and not edition.ocaid:
+        edition['ocaid'] = rec['ocaid']
         need_edition_save = True
 
     # Add list fields to edition as needed
@@ -774,16 +878,17 @@ def update_edition_with_rec_data(
             continue
         # ensure values is a list
         values = rec[f] if isinstance(rec[f], list) else [rec[f]]
-        if f in e:
+        if f in edition:
             # get values from rec that are not currently on the edition
-            to_add = [v for v in values if v not in e[f]]
-            e[f] += to_add
+            to_add = [v for v in values if v not in edition[f]]
+            edition[f] += to_add
         else:
-            e[f] = to_add = values
+            edition[f] = to_add = values
         if to_add:
             need_edition_save = True
 
     other_edition_fields = [
+        'description',
         'number_of_pages',
         'publishers',
         'publish_date',
@@ -791,25 +896,25 @@ def update_edition_with_rec_data(
     for f in other_edition_fields:
         if f not in rec or not rec[f]:
             continue
-        if f not in e:
-            e[f] = rec[f]
+        if f not in edition:
+            edition[f] = rec[f]
             need_edition_save = True
 
     # Add new identifiers
     if 'identifiers' in rec:
-        identifiers = defaultdict(list, e.dict().get('identifiers', {}))
+        identifiers = defaultdict(list, edition.dict().get('identifiers', {}))
         for k, vals in rec['identifiers'].items():
             identifiers[k].extend(vals)
             identifiers[k] = list(set(identifiers[k]))
-        if e.dict().get('identifiers') != identifiers:
-            e['identifiers'] = identifiers
+        if edition.dict().get('identifiers') != identifiers:
+            edition['identifiers'] = identifiers
             need_edition_save = True
 
     return need_edition_save
 
 
 def update_work_with_rec_data(
-    rec: dict, e: "Edition", w: "Work", need_work_save: bool
+    rec: dict, edition: "Edition", work: dict[str, Any], need_work_save: bool
 ) -> bool:
     """
     Enrich the Work by adding certain fields present in rec but absent
@@ -819,39 +924,56 @@ def update_work_with_rec_data(
     """
     # Add subjects to work, if not already present
     if 'subjects' in rec:
-        work_subjects = list(w.get('subjects', []))
+        work_subjects = list(work.get('subjects', []))
         for s in rec['subjects']:
             if s not in work_subjects:
                 work_subjects.append(s)
                 need_work_save = True
         if need_work_save and work_subjects:
-            w['subjects'] = work_subjects
+            work['subjects'] = work_subjects
 
     # Add cover to work, if needed
-    if not w.get('covers') and e.get_covers():
-        w['covers'] = [e['covers'][0]]
+    if not work.get('covers') and edition.get_covers():
+        work['covers'] = [edition['covers'][0]]
         need_work_save = True
 
     # Add description to work, if needed
-    if not w.get('description') and e.get('description'):
-        w['description'] = e['description']
+    if not work.get('description') and edition.get('description'):
+        work['description'] = edition['description']
         need_work_save = True
 
     # Add authors to work, if needed
-    if not w.get('authors'):
+    if not work.get('authors'):
         authors = [import_author(a) for a in rec.get('authors', [])]
-        w['authors'] = [
+        work['authors'] = [
             {'type': {'key': '/type/author_role'}, 'author': a.key}
             for a in authors
             if a.get('key')
         ]
-        if w.get('authors'):
+        if work.get('authors'):
             need_work_save = True
 
     return need_work_save
 
 
-def load(rec, account_key=None):
+def should_overwrite_promise_item(
+    edition: "Edition", from_marc_record: bool = False
+) -> bool:
+    """
+    Returns True for revision 1 promise items with MARC data available.
+
+    Promise items frequently have low quality data, and MARC data is high
+    quality. Overwriting revision 1 promise items with MARC data ensures
+    higher quality records and eliminates the risk of obliterating human edits.
+    """
+    if edition.get('revision') != 1 or not from_marc_record:
+        return False
+
+    # Promise items are always index 0 in source_records.
+    return bool(safeget(lambda: edition['source_records'][0], '').startswith("promise"))
+
+
+def load(rec, account_key=None, from_marc_record: bool = False):
     """Given a record, tries to add/match that edition in the system.
 
     Record is a dictionary containing all the metadata of the edition.
@@ -861,9 +983,12 @@ def load(rec, account_key=None):
         * source_records: list
 
     :param dict rec: Edition record to add
+    :param bool from_marc_record: whether the record is based on a MARC record.
     :rtype: dict
     :return: a dict to be converted into a JSON HTTP response, same as load_data()
     """
+    if not is_promise_item(rec):
+        validate_record(rec)
 
     normalize_import_record(rec)
 
@@ -881,46 +1006,56 @@ def load(rec, account_key=None):
 
     # We have an edition match at this point
     need_work_save = need_edition_save = False
-    # w = None
-    w: "Work"
-    e: "Edition" = web.ctx.site.get(match)
+    work: dict[str, Any]
+    existing_edition: Edition = web.ctx.site.get(match)
+
     # check for, and resolve, author redirects
-    for a in e.authors:
+    for a in existing_edition.authors:
         while is_redirect(a):
-            if a in e.authors:
-                e.authors.remove(a)
+            if a in existing_edition.authors:
+                existing_edition.authors.remove(a)
             a = web.ctx.site.get(a.location)
             if not is_redirect(a):
-                e.authors.append(a)
+                existing_edition.authors.append(a)
 
-    if e.get('works'):
-        w = e.works[0].dict()
+    if existing_edition.get('works'):
+        work = existing_edition.works[0].dict()
         work_created = False
     else:
         # Found an edition without a work
         work_created = need_work_save = need_edition_save = True
-        w = new_work(e.dict(), rec)
-        e.works = [{'key': w['key']}]
+        work = new_work(existing_edition.dict(), rec)
+        existing_edition.works = [{'key': work['key']}]
+
+    # Send revision 1 promise item editions to the same pipeline as new editions
+    # because we want to overwrite most of their data.
+    if should_overwrite_promise_item(
+        edition=existing_edition, from_marc_record=from_marc_record
+    ):
+        return load_data(
+            rec, account_key=account_key, existing_edition=existing_edition
+        )
 
     need_edition_save = update_edition_with_rec_data(
-        rec=rec, account_key=account_key, e=e
+        rec=rec, account_key=account_key, edition=existing_edition
     )
     need_work_save = update_work_with_rec_data(
-        rec=rec, e=e, w=w, need_work_save=need_work_save
+        rec=rec, edition=existing_edition, work=work, need_work_save=need_work_save
     )
 
     edits = []
     reply = {
         'success': True,
         'edition': {'key': match, 'status': 'matched'},
-        'work': {'key': w['key'], 'status': 'matched'},
+        'work': {'key': work['key'], 'status': 'matched'},
     }
+
     if need_edition_save:
-        reply['edition']['status'] = 'modified'
-        edits.append(e.dict())
+        reply['edition']['status'] = 'modified'  # type: ignore[index]
+        edits.append(existing_edition.dict())
     if need_work_save:
-        reply['work']['status'] = 'created' if work_created else 'modified'
-        edits.append(w)
+        reply['work']['status'] = 'created' if work_created else 'modified'  # type: ignore[index]
+        edits.append(work)
     if edits:
         web.ctx.site.save_many(
             edits, comment='import existing book', action='edit-book'
